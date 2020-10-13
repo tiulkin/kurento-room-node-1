@@ -1,12 +1,14 @@
 module.exports = class Participant {
-    constructor(socket, roomManager) {
+    constructor(roomManager, socket, request ) {
         this.socket = socket;
+        this.client = request.client;
         this.roomManager = roomManager;
         this.kms = roomManager.kms;
-
+        this.sessionId = request.headers['sec-websocket-key'];
         this.roomName = null;
-        this.publisher = null;
-        this.subscribers = {};
+        this.endpoint = null
+        this.isPublishing = null;
+        this.subscriberEndpoints = {};
         this.candidates = {};
 
         this.state = {
@@ -14,20 +16,252 @@ module.exports = class Participant {
             name: null
         };
 
-        socket
-            .emit('id', { id: this.state.id })
+        socket.on('message', this.processMessage.bind(this))
+        socket.on('close', ()=>{
+            if(this.id) {
+                this.notifyUserLeft();
+                this.closeEndpoints();
+                this.roomManager.unregisterParticipant(this.id)
+                console.log('Connection ' + this.id + ' ' + this.sessionId + ' closed');
+            }
+        });
+        socket.on('error', ()=>{
+            if(this.id) {
+                this.stop();
+                this.roomManager.unregisterParticipant(this.id)
+                console.log('Connection ' + this.sessionId + ' error');
+            }
+        });
 
-        .on('error', () => this.leaveRoom())
-            .on('leaveRoom', () => this.leaveRoom())
-            .on('disconnect', () => this.leaveRoom())
-
-        .on('chatAll', message => this.chatAll(message))
-            .on('register', payload => this.register(payload))
-            .on('joinRoom', roomName => this.joinRoom(roomName))
-            .on('receiveVideo', payload => this.receiveVideo(payload))
-            .on('onIceCandidate', payload => this.onIceCandidate(payload));
-        console.log(`Received new client : ${this.state.id}`);
+        console.log(`Received new client : ${this.client}`);
     }
+
+    processMessage(message){
+        // console.log('message for' + this.id + ':')
+        // console.log(message)
+
+        try {
+            const messageData = JSON.parse(message);
+            const method = messageData?.method;
+            this[method](messageData);
+        } catch (e) {
+            console.warn(e)
+        }
+    }
+
+    sendMessage(message){
+        console.log(message);
+    }
+
+    ping(message) {
+        // console.log(this.client)
+        this.socket?.send(JSON.stringify({
+            id: message?.id,
+            jsonrpc: '2.0',
+            result: {value: 'pong'}
+        }));
+    }
+
+    joinRoom(message) {
+        this.roomName = message.params.room;
+        if(this.roomManager.getParticipantById(message.params.user)) {
+            this.socket?.send(JSON.stringify({
+                id: message.id,
+                error:{
+                    code:104,
+                    message: `User ${this.message.params.user} already exists in room ${this.roomName}`
+                },
+                jsonrpc: '2.0'
+            }))
+        } else {
+            this.id = message.params.user;
+            // console.log('roommates:', this.roomManager.getParticipantsByRoom(this.roomName))
+            this.roomManager.registerParticipant(this);
+            this.roomManager.addParticipantToRoom(this.roomName, this)
+
+            this.socket?.send(JSON.stringify({
+                id: message.id,
+                result: {
+                    value: this.roomManager.getParticipantsByRoom(this.roomName)
+                        .filter(participant => participant.getId() !== this.getId())
+                        .map(participant => ({
+                            id: participant.getId(),
+                            streams: participant.isPublishing ? ['webcam'] : []
+                        }))
+                },
+                jsonrpc: '2.0'
+            }))
+        }
+    }
+
+    leaveRoom(){
+        if(!this.id)return;
+        this.roomManager.unregisterParticipant(this.id)
+        this.stop()
+    }
+    stop(){
+        this.notifyUserLeft();
+        this.socket?.close();
+        this.socket=null;
+    }
+
+    notifyUserLeft(){
+        this.roomManager.getParticipantsByRoom(this.roomName)
+            .filter(participant => participant.getId() !== this.getId())
+            .forEach(participant => participant.getSocket().send(JSON.stringify({
+                method:'participantLeft',
+                params:{'name':this.id},
+                jsonrpc:'2.0'
+            })))
+    }
+
+    closeEndpoints(){
+        this.endpoint?.release();
+        Object.values(this.subscriberEndpoints).forEach(endpoint=>endpoint.release())
+    }
+
+    publishVideo(message){
+        if(!this.id)return;
+        const sdpOffer = message.params.sdpOffer
+        const id = message.id
+
+        this.roomManager.addPublisherEndpoint(this.roomName, this).then(endpoint => {
+            this.endpoint = endpoint;
+            while(this.candidates[this.id]?.length) {
+                const candidate =this.candidates[this.id].shift()
+                endpoint.addIceCandidate(candidate);
+            }
+
+            endpoint.on('IceComponentStateChange',event=> {
+                console.log('event.state', event.state);
+                if (event.state === 'CONNECTED') {
+                    this.isPublishing = true;
+                    this.roomManager.addPublisherToRoom(this.roomName, this.id)
+                }
+            })
+            // endpoint.on('NewCandidatePairSelected',event=> {console.log('NewCandidatePairSelected',event)})
+
+            endpoint.on('OnIceCandidate', event=> {
+                var candidate = this.kms.Ice(event.candidate);
+                // console.log('candidate', candidate);
+                this.socket?.send(JSON.stringify({
+                    jsonrpc: '2.0',
+                    method : 'iceCandidate',
+                    params : {endpointName:this.id, ...candidate}
+                }));
+            });
+
+            endpoint.processOffer(sdpOffer, (error, sdpAnswer) =>{
+                if (error) {
+                    // stop(sessionId);
+                    return callback(error);
+                }
+
+                this.socket?.send(JSON.stringify({
+                    id,
+                    result : {sdpAnswer, sessionId: this.session},
+                    jsonrpc: '2.0'
+                }));
+            });
+
+            endpoint.gatherCandidates(function(error) {
+                if (error) {
+                    // stop(sessionId);
+                    console.log('gatherCandidates', error)
+                    return callback(error);
+                }
+            });
+
+        })
+    }
+
+    onIceCandidate(message) {
+        if(!this.id)return;
+        const id = message.id;
+        const endpointId=message.params.endpointName;
+        const candidate = this.kms.Ice(message.params);
+
+        const endpointForIceCandidate = endpointId === this.getId() ? this.endpoint :
+            this.roomManager.getParticipantById(endpointId).subscriberEndpoints[this.getId()]
+        if(endpointForIceCandidate) {
+            endpointForIceCandidate.addIceCandidate(candidate);
+        }
+        else {
+            if (!this.candidates[endpointId]) {
+                this.candidates[endpointId] = [candidate]
+            }
+            else {
+                this.candidates[endpointId].push(candidate)
+            }
+        }
+        this.socket?.send(JSON.stringify({
+            id,
+            result: {sessionId: this.session},
+            jsonrpc: '2.0'
+        }));
+    }
+
+    receiveVideoFrom(message){
+        if(!this.id)return;
+        const id = message.id;
+        const senderId = message.params.sender.split('_')[0];
+        const sdpOffer = message.params.sdpOffer;
+
+        console.log(`${this.getId()} receive from ${senderId}`);
+        if (senderId === this.getId()) return;
+
+        const sender = this.roomManager.getParticipantById(senderId);
+        const senderEndpoint = sender.endpoint;
+        if (!sender || !sender.isPublishing || !sender.endpoint) return console.log(`participant ${senderId} is not in room`);
+
+        const roomPipeline = this.roomManager.getPipeline(this.roomName);
+        roomPipeline.create('WebRtcEndpoint', (error, receiverEndpoint) => {
+            while(this.candidates[senderId]?.length) {
+                const candidate =this.candidates[senderId].shift()
+                receiverEndpoint.addIceCandidate(candidate);
+            }
+
+            console.log('receive video piveline created', error)
+            // if (error) {
+            //     return callback(error);
+            // }
+            sender.subscriberEndpoints[this.getId()]=receiverEndpoint;
+            receiverEndpoint.on('OnIceCandidate', event => {
+                var candidate = this.kms.Ice(event.candidate);
+
+                this.socket?.send(JSON.stringify({
+                    jsonrpc: '2.0',
+                    method : 'iceCandidate',
+                    params : {endpointName:senderId, ...candidate}
+                }));
+            });
+
+            receiverEndpoint.processOffer(sdpOffer, (error, sdpAnswer) =>{
+                if (error) {
+                    // stop(sessionId);
+                    return callback(error);
+                }
+                console.log('receiveing video create sdpAnswer', error);
+                senderEndpoint.connect(receiverEndpoint, error => {
+                    console.log('receiveing video connected',error);
+                    this.socket?.send(JSON.stringify({
+                        id,
+                        result : {sdpAnswer, sessionId: this.session},
+                        jsonrpc: '2.0'
+                    }));
+
+                    receiverEndpoint.gatherCandidates(function(error) {
+                        if (error) {
+                            // stop(sessionId);
+                            console.log('gatherCandidates', error)
+                            return callback(error);
+                        }
+                    });
+                })
+            });
+        })
+    }
+
 
     addCandidatesToEndpoint(senderId, endpoint) {
         this.getCandidates(senderId).forEach(({ candidate }) =>
@@ -36,202 +270,12 @@ module.exports = class Participant {
         return this;
     }
 
-    newSubscriberEndpoint(sender, pipeline) {
-        const endpoint = pipeline.create('WebRtcEndpoint');
-        endpoint.then((endpoint) => {
-            console.log(`${this.id} > successfully created subscriber endpoint for ${sender.id}`);
-
-            endpoint.setMaxVideoRecvBandwidth(300);
-            endpoint.setMinVideoRecvBandwidth(300);
-
-            this.subscribers[sender.id] = endpoint;
-
-            this.candidates[sender.id] = this.candidates[sender.id] || [];
-            this.candidates[sender.id].forEach(({ candidate }) => {
-                endpoint.addIceCandidate(candidate);
-            });
-
-            endpoint.on('OnIceCandidate', (event) => {
-                const candidate = this.roomManager.Ice(event.candidate);
-                this.notifyClient('iceCandidate', { sessionId: sender.id, candidate: candidate });
-            });
-        });
-        return endpoint;
-    }
-
-
-    addSubscriberEndpoint(senderId, endpoint) {
-        this.subscribers[senderId] = endpoint;
-        return this;
-    }
-
-    subscribeToIceCandidate(senderId, endpoint) {
-        endpoint.on('OnIceCandidate', ({ candidate }) => {
-            const ice = this.kms.Ice(candidate);
-            this.notifyClient('iceCandidate', { senderId, candidate: ice });
-        });
-        return this;
-    }
-
-    initIceExchange(senderId, endpoint) {
-        // methods needed in exchange process
-        const steps = [
-            'addSubscriberEndpoint',
-            'addCandidatesToEndpoint',
-            'subscribeToIceCandidate'
-        ];
-        steps.forEach(method => this[method](senderId, endpoint));
-    }
-
-    newSubscriber(senderId) {
-        return this.kms.newWebRtcEndpoint(this.roomName);
-    }
-
-    connectToRemote(endpoint, senderEndpoint) {
-        senderEndpoint.connect(endpoint);
-        return endpoint;
-    }
-
-    getRemoteEndpoint(senderId) {
-        const subscriber = (senderId === this.getId()) ?
-            this.publisher :
-            this.getSubscriber(senderId, true);
-
-        return subscriber || this.newSubscriber(senderId);
-    }
-
-    receiveVideo({ senderId, sdpOffer }) {
-        console.log(`${this.getId()} receive from ${senderId}`);
-
-        const sender = this.roomManager.getParticipantById(senderId);
-        if (!sender) return console.log(`participant ${senderId} is not in room`);
-
-        this.getRemoteEndpoint(senderId).then(endpoint => {
-            this.initIceExchange(senderId, endpoint);
-            this.connectToRemote(endpoint, sender.publisher);
-            endpoint.processOffer(sdpOffer).then(sdpAnswer =>
-                this.notifyClient('gotAnswer', { senderId, sdpAnswer })
-            );
-        });
-
-        console.log(`${this.getId()} answered to ${senderId}`);
-    }
-
-    addCandidate(senderId, candidate) {
-        const subscriber = (senderId !== this.getId()) ?
-            this.getSubscriber(senderId, true) :
-            this.publisher;
-
-        if (subscriber) {
-            subscriber.addIceCandidate(candidate);
-        }
-        this.getCandidates(senderId).push({ candidate });
-    }
-
-    leaveRoom() {
-        const pid = this.getId();
-        this.notifyOthers('participantLeft', pid);
-        this.releaseEndpoints();
-        this.candidates = {};
-        this.roomManager.unregisterParticipant(pid, this.roomName);
-    }
-
-    register(name) {
-        const uid = this.getId();
-        this.state.name = name;
-        this.roomManager.registerParticipant(this);
-        this.notifyClient('registered', `Successfully registered ${uid}`);
-    }
-
-    joinRoom(roomName) {
-        const id = this.getId();
-
-        this.roomName = roomName;
-        this.roomManager.addParticipantToRoom(roomName, this).then(endpoint => {
-            this.socket.join(roomName);
-            this.setPublisher(endpoint)
-                .addCandidatesToEndpoint(id, endpoint)
-                .subscribeToIceCandidate(id, endpoint)
-                .sendStateToRoom()
-                .sendRoomStateToSelf(this.roomManager.participantsByRoom[roomName]);
-        });
-    }
-
-    onIceCandidate({ senderId, candidate }) {
-        const IceCandidate = this.kms.Ice(candidate);
-        this.setCandidates(senderId);
-        this.addCandidate(senderId, IceCandidate);
-    }
-
-    chatAll(message) {
-        this.notifyRoom('newMessage', { message, from: this.name });
-    }
-
-    notifyClient(notification, data) {
-        this.socket.emit(notification, data);
-    }
-
-    notifyOthers(notification, data) {
-        this.socket.to(this.roomName).emit(notification, data);
-    }
-
-    notifyRoom() {
-        this.notifyOthers(notification, data);
-        this.notifyClient(notification, data);
-    }
-
-    releaseEndpoints() {
-        this.publisher && this.publisher.release();
-        Object.values(this.subscribers).forEach(endpoint => endpoint.release());
-        this.publisher = null;
-        this.subscribers = {};
-    }
-
-    sendStateToRoom() {
-        this.notifyOthers('newParticipant', this.getState());
-        return this;
-    }
-
-    sendRoomStateToSelf(roomParticipants) {
-        this.notifyClient('existingParticipants', roomParticipants);
-        return this;
-    }
-
-    getCandidates(id) {
-        return this.candidates[id] || [];
-    }
-
-    setCandidates(id) {
-        this.candidates[id] = this.candidates[id] || [];
-    }
-
-    setPublisher(endpoint) {
-        this.publisher = endpoint;
-        return this;
-    }
-
-    // can return null for boolean comparison
-    getSubscriber(id, returnNull = false) {
-        return this.subscribers[id] || (returnNull ? null : []);
-    }
 
     getId() {
-        return this.state.id;
+        return this.id;
+    }
+    getSocket() {
+        return this.socket;
     }
 
-    getState() {
-        return this.state;
-    }
-
-    getFromState(property) {
-        if (!this.state[property])
-            throw new Error(`Property ${property} not found in participant`);
-        return this.state[property];
-    }
-
-    setState(obj) {
-        Object.keys(obj)
-            .filter(key => this.state.hasOwnProperty(key))
-            .forEach(key => { this.state[key] = obj[key] });
-    }
 }

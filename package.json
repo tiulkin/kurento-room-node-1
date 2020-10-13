@@ -21,20 +21,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AbdullahZN/kurento-room-node.git"
+    "url": "git@stash.prostream.ru:7999/~otulkin/smartu-kurento-room-node.git"
   },
   "author": "Abdullah Uzun",
   "license": "MIT",
   "dependencies": {
+    "kurento-client": "^6.0.0",
     "socket.io": "^1.7.4",
-    "kurento-client": "^6.0.0"
+    "ws": "^7.3.1"
   },
   "devDependencies": {
     "express": "^4.15.3",
     "path": "^0.12.7"
-  },
-  "bugs": {
-    "url": "https://github.com/AbdullahZN/kurento-room-node/issues"
-  },
-  "homepage": "https://github.com/AbdullahZN/kurento-room-node#readme"
+  }
 }

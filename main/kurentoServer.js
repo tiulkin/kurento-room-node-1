@@ -7,7 +7,7 @@ module.exports = (app, config) => {
     const uri = `${config.server.uri}:${port}`;
     const opts = {
         key: fs.readFileSync(config.secure.key),
-        cert: fs.readFileSync(config.secure.cert)
+        cert: fs.readFileSync(config.secure.cert),
     };
     const server = https.createServer(opts, app).listen(port, (err) =>
         console.log(err || `Listening at ${uri}`)

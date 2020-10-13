@@ -1,6 +1,7 @@
 # kurento-room-node
 
 Kurento Room Server in NodeJS
+Переделано под протокол и логику работы платформы SU
 
 ### Installation
 Install package from npm or yarn

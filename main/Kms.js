@@ -11,11 +11,10 @@ module.exports = class Kms {
   }
 
   newWebRtcEndpoint(name) {
-    return this.pipelines[name].create('WebRtcEndpoint').then(endpoint => {
-      endpoint.setMaxVideoSendBandwidth(MAX_BANDWITH);
-      endpoint.setMinVideoSendBandwidth(MIN_BANDWITH);
-      return endpoint;
-    });
+    const endpoint = this.pipelines[name].create('WebRtcEndpoint')
+    endpoint.setMaxVideoSendBandwidth(MAX_BANDWITH);
+    endpoint.setMinVideoSendBandwidth(MIN_BANDWITH);
+    return endpoint;
   }
 
   newPipeline(name) {

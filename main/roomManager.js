@@ -1,20 +1,34 @@
-const io = require('socket.io');
+const WebSocket = require('ws');
 const Participant = require('./participant');
 const Kms = require('./Kms');
 
 module.exports = class kurentoRoom {
     constructor(server, kmsUri) {
-        if (server) this.initSocketConnection(server);
+        this.wss = new WebSocket.Server({
+            server, clientTracking: true,
+            backlog:2000,
+            perMessageDeflate:false,
+            maxPayload:2000000,
+            path : '/room'
+
+        });
+        this.initSocketConnection();
         this.kms = new Kms(kmsUri);
         this.participantsByRoom = { /*  roomName: [] */ };
         this.participantsById = { /*  id : participant  */ };
     }
 
-    initSocketConnection(server) {
-        io(server).on('connection', socket => new Participant(socket, this));
+    initSocketConnection() {
+        this.wss.on('connection', (ws, request) => {
+            new Participant(this,ws,request)
+        });
     }
 
     registerParticipant(participant) {
+        if (this.participantsById[participant.getId()]){
+            const oldParticipant = this.participantsById[participant.getId()]
+            oldParticipant.stop()
+        }
         this.participantsById[participant.getId()] = participant;
     }
 
@@ -22,37 +36,66 @@ module.exports = class kurentoRoom {
         const list = this.getParticipantsByRoom(roomName) || [];
         this.participantsByRoom[roomName] = list.filter(participant => participant.id !== id);
         delete this.participantsById[id];
+        if (this.participantsByRoom[roomName].length === 0){
+            this.removePipeline()
+        }
     }
 
-    setRoomParticipantList(roomName) {
-        console.log(`Created new room ${roomName}`);
-        this.participantsByRoom[roomName] = [ /* participant : name */ ];
+    newPipeline(roomName) {
+        return this.kms.newPipeline(roomName);
     }
 
-    createPublisherEndpoint(roomName, participant) {
-        return this.kms.newWebRtcEndpoint(roomName);
+    addParticipantToRoom(roomName, newParticipant) {
+        if (!newParticipant) return;
+        if (!this.participantsByRoom[roomName]) this.participantsByRoom[roomName] = [];
+        this.participantsByRoom[roomName]
+            .filter(participant=>participant.getId()!==newParticipant.getId())
+            .forEach(participant => participant.socket.send(JSON.stringify({
+            method:'participantJoined',
+            jsonrpc: '2.0',
+            params: {id: newParticipant.getId()}
+        })))
+        this.participantsByRoom[roomName].push(newParticipant);
+
     }
 
-    newPipeline(roomName, participant) {
-        return this.kms.newPipeline(roomName).then(pipeline =>
-            this.setRoomParticipantList(roomName)
-        );
+    addPublisherToRoom(roomName, participantId) {
+        if (!this.participantsByRoom[roomName]) this.participantsByRoom[roomName] = [];
+        this.participantsByRoom[roomName]
+            .filter(participant=>participant.getId()!==participantId)
+            .forEach(participant => participant.socket.send(JSON.stringify({
+                method:'participantPublished',
+                jsonrpc: '2.0',
+                params: {'id':participantId, streams:[{id:"webcam"}]}
+            })))
+
     }
 
-    addParticipantToRoom(roomName, participant) {
+    addPublisherEndpoint(roomName, participant){
         if (!participant) return;
-
-        return (this.getPipeline(roomName) || this.newPipeline(roomName))
-            .then(() => this.createPublisherEndpoint(roomName, participant))
+        console.log(`addParticipantToRoom  ${participant.id}` );
+        if (this.getPipeline(roomName)) {
+            return this.kms.newWebRtcEndpoint(roomName).then(endpoint => {
+                console.log(`created endpoint for ${participant.id}`);
+                return endpoint;
+            });
+        }
+        else
+        return (this.newPipeline(roomName))
+            .then(() => this.kms.newWebRtcEndpoint(roomName))
             .then(endpoint => {
-                console.log(`created endpoint for ${participant.state.name}`);
-                this.participantsByRoom[roomName].push(participant.getState());
+                console.log(`created endpoint for ${participant.id}`);
                 return endpoint;
             });
     }
 
     getPipeline(roomName) {
-        return this.kms.pipelines[roomName] || null;
+        return this.kms.pipelines[roomName] || null
+    }
+
+    removePipeline(roomName) {
+        this.kms.pipelines[roomName]?.release()
+        delete this.kms.pipelines[roomName]
     }
 
     getParticipantById(id) {
@@ -60,14 +103,7 @@ module.exports = class kurentoRoom {
     }
 
     getParticipantsByRoom(roomName) {
-        return this.participantsByRoom[roomName] || null;
+        return this.participantsByRoom[roomName] || [];
     }
 
-    getEveryParticipants() {
-        return this.participantsByRoom;
-    }
-
-    getKms() {
-        return this.kms;
-    }
 }
